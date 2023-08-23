@@ -1,4 +1,3 @@
-#include "tensorflow/lite/core/c/common.h"
 #include "tensorflow/lite/micro/kernels/kernel_util.h"
 
 namespace tflite {
@@ -21,6 +20,9 @@ ShapeInfo GetShapeInfo(TfLiteIntArray *query_dims, TfLiteIntArray *value_dims) {
     ShapeInfo shape_info{};
     int query_dims_count = query_dims->size;
     int value_dims_count = value_dims->size;
+    TFLITE_DCHECK_GE(query_dims_count, 2);
+    TFLITE_DCHECK_GE(value_dims_count, 2);
+
     shape_info.query_features = query_dims->data[query_dims_count - 1];
     shape_info.value_features = value_dims->data[value_dims_count - 1];
     shape_info.query_batches = 1;
@@ -38,9 +40,10 @@ void *Init(TfLiteContext *context, const char *buffer, size_t length) {
         context->AllocatePersistentBuffer(context, sizeof(OpData)));
     TFLITE_DCHECK(op_data != nullptr);
 
+    // get parameters, the values are ordered alphabetically
     TFLITE_DCHECK(buffer != nullptr);
     TFLITE_DCHECK(length > 0);
-    tflite::FlexbufferWrapper fbw(reinterpret_cast<const uint8_t *>(buffer), length);
+    tflite::FlexbufferWrapper fbw(reinterpret_cast<const uint8_t*>(buffer), length);
     op_data->key_dim = fbw.ElementAsInt32(0);
     op_data->num_heads = fbw.ElementAsInt32(1);
 
@@ -48,10 +51,11 @@ void *Init(TfLiteContext *context, const char *buffer, size_t length) {
 }
 
 TfLiteStatus Prepare(TfLiteContext *context, TfLiteNode *node) {
-    TFLITE_DCHECK(node->user_data != nullptr);
+    MicroContext *micro_context = GetMicroContext(context);
+
+    TF_LITE_ENSURE(context, node->user_data != nullptr);
     auto *op_data = reinterpret_cast<OpData*>(node->user_data);
 
-    MicroContext *micro_context = GetMicroContext(context);
     TfLiteTensor *query = micro_context->AllocateTempInputTensor(node, 0);
     TfLiteTensor *value = micro_context->AllocateTempInputTensor(node, 1);
     TfLiteTensor *query_kernel = micro_context->AllocateTempInputTensor(node, 2);
@@ -65,10 +69,45 @@ TfLiteStatus Prepare(TfLiteContext *context, TfLiteNode *node) {
     TfLiteTensor *attention_output = micro_context->AllocateTempOutputTensor(node, 0);
 
     ShapeInfo shape_info = GetShapeInfo(query->dims, value->dims);
+
+    TF_LITE_ENSURE_EQ(context, query_kernel->dims->size, 3);
+    TF_LITE_ENSURE_EQ(context, query_kernel->dims->data[0], shape_info.query_features);
+    TF_LITE_ENSURE_EQ(context, query_kernel->dims->data[1], op_data->num_heads);
+    TF_LITE_ENSURE_EQ(context, query_kernel->dims->data[2], op_data->key_dim);
+
+    TF_LITE_ENSURE_EQ(context, query_bias->dims->size, 2);
+    TF_LITE_ENSURE_EQ(context, query_bias->dims->data[0], op_data->num_heads);
+    TF_LITE_ENSURE_EQ(context, query_bias->dims->data[1], op_data->key_dim);
+
+    TF_LITE_ENSURE_EQ(context, key_kernel->dims->size, 3);
+    TF_LITE_ENSURE_EQ(context, key_kernel->dims->data[0], shape_info.value_features);
+    TF_LITE_ENSURE_EQ(context, key_kernel->dims->data[1], op_data->num_heads);
+    TF_LITE_ENSURE_EQ(context, key_kernel->dims->data[2], op_data->key_dim);
+
+    TF_LITE_ENSURE_EQ(context, key_bias->dims->size, 2);
+    TF_LITE_ENSURE_EQ(context, key_bias->dims->data[0], op_data->num_heads);
+    TF_LITE_ENSURE_EQ(context, key_bias->dims->data[1], op_data->key_dim);
+
+    TF_LITE_ENSURE_EQ(context, value_kernel->dims->size, 3);
+    TF_LITE_ENSURE_EQ(context, value_kernel->dims->data[0], shape_info.value_features);
+    TF_LITE_ENSURE_EQ(context, value_kernel->dims->data[1], op_data->num_heads);
+    TF_LITE_ENSURE_EQ(context, value_kernel->dims->data[2], op_data->key_dim);
+
+    TF_LITE_ENSURE_EQ(context, value_bias->dims->size, 2);
+    TF_LITE_ENSURE_EQ(context, value_bias->dims->data[0], op_data->num_heads);
+    TF_LITE_ENSURE_EQ(context, value_bias->dims->data[1], op_data->key_dim);
+
+    TF_LITE_ENSURE_EQ(context, output_kernel->dims->size, 3);
+    TF_LITE_ENSURE_EQ(context, output_kernel->dims->data[0], op_data->num_heads);
+    TF_LITE_ENSURE_EQ(context, output_kernel->dims->data[1], op_data->key_dim);
+    TF_LITE_ENSURE_EQ(context, output_kernel->dims->data[2], shape_info.query_features);
+
+    TF_LITE_ENSURE_EQ(context, output_bias->dims->size, 1);
+    TF_LITE_ENSURE_EQ(context, output_bias->dims->data[0], shape_info.query_features);
+
     size_t scratch_size = 2 * shape_info.value_batches * op_data->key_dim /* kproj and vproj */ +
                           op_data->key_dim /* qbuf */ + op_data->key_dim /* vbuf */;
-    TF_LITE_ENSURE_OK(context, context->RequestScratchBufferInArena(
-        context, scratch_size, &op_data->scratch_index));
+    TF_LITE_ENSURE_OK(context, context->RequestScratchBufferInArena(context, scratch_size, &op_data->scratch_index));
 
     micro_context->DeallocateTempTfLiteTensor(query);
     micro_context->DeallocateTempTfLiteTensor(value);
@@ -98,12 +137,11 @@ TfLiteStatus Invoke(TfLiteContext *context, TfLiteNode *node) {
     const TfLiteEvalTensor *output_bias = tflite::micro::GetEvalInput(context, node, 9);
     TfLiteEvalTensor *attention_output = tflite::micro::GetEvalOutput(context, node, 0);
 
-    TFLITE_DCHECK(node->user_data != nullptr);
+    TF_LITE_ENSURE(context, node->user_data != nullptr);
     auto *op_data = reinterpret_cast<OpData*>(node->user_data);
     ShapeInfo shape_info = GetShapeInfo(query->dims, value->dims);
 
-    auto *scratch_buffer = reinterpret_cast<float *>(
-        context->GetScratchBuffer(context, op_data->scratch_index));
+    auto *scratch_buffer = reinterpret_cast<float*>(context->GetScratchBuffer(context, op_data->scratch_index));
     float *kproj = scratch_buffer;
     float *vproj = kproj + shape_info.value_batches * op_data->key_dim;
     float *qbuf = vproj + shape_info.value_batches * op_data->key_dim;
@@ -173,8 +211,7 @@ TfLiteStatus Invoke(TfLiteContext *context, TfLiteNode *node) {
 }
 
 TFLMRegistration *Register_MY_ATTENTION() {
-    static TFLMRegistration r = tflite::micro::RegisterOp(
-        Init, Prepare, Invoke);
+    static TFLMRegistration r = tflite::micro::RegisterOp(Init, Prepare, Invoke);
     return &r;
 }
 
